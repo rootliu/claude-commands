@@ -1,6 +1,6 @@
 ---
-argument-hint: [sync|discover|full] [--topics=reasoning,agentic,world-model,...] [--year=2026]
-description: Sync missing Zotero PDFs from arXiv, discover new papers by topic, and import with user confirmation
+argument-hint: [sync|discover|full|repair] [--topics=reasoning,agentic,world-model,...] [--year=2026]
+description: Sync missing Zotero PDFs from arXiv, discover new papers by topic, repair DB integrity, and import with user confirmation
 ---
 
 # Zotero Paper Sync & Discovery
@@ -12,8 +12,9 @@ Manage a Zotero library: sync missing PDFs, discover new papers from arXiv/blogs
 - `sync` (default): Scan Zotero DB for missing PDFs, download from arXiv, link to Zotero
 - `discover`: Search arXiv + blogs for new papers matching research interests, ask user one-by-one, import selected
 - `full`: Run sync first, then discover
+- `repair`: Scan and fix DB integrity issues (invalid keys, wrong field IDs, orphan records, dangling references)
 
-Usage: `/sync-zotero`, `/sync-zotero sync`, `/sync-zotero discover --topics=reasoning,agentic`, `/sync-zotero full`
+Usage: `/sync-zotero`, `/sync-zotero sync`, `/sync-zotero discover --topics=reasoning,agentic`, `/sync-zotero full`, `/sync-zotero repair`
 
 ---
 
@@ -289,36 +290,67 @@ os.makedirs(storage_dir, exist_ok=True)
 shutil.copy2(src_pdf, os.path.join(storage_dir, pdf_filename))
 ```
 
-### Step 8 — Post-Write Validation
+### Step 8 — Validate and Commit
 
-**CRITICAL**: After writing to DB, always validate:
+**MANDATORY**: Every DB write operation MUST end with `validate_and_commit()`. Never call `conn.commit()` directly.
 
 ```python
-# 1. Check no FK violations
-c.execute('PRAGMA foreign_key_check')
-violations = c.fetchall()
-assert not violations, f"FK violations: {violations}"
+def validate_and_commit(conn):
+    """Validate DB integrity and commit. Raises on failure, rolls back."""
+    c = conn.cursor()
+    VALID_CHARS = set('23456789ABCDEFGHIJKLMNPQRSTUVWXYZ')
+    errors = []
 
-# 2. Check all synced=0 items have valid keys
-c.execute('SELECT key FROM items WHERE synced = 0')
-VALID_CHARS = set('23456789ABCDEFGHIJKLMNPQRSTUVWXYZ')
-for (key,) in c.fetchall():
-    assert len(key) == 8 and all(ch in VALID_CHARS for ch in key), f"Bad key: {key}"
+    # 1. Check no FK violations
+    c.execute('PRAGMA foreign_key_check')
+    violations = c.fetchall()
+    if violations:
+        errors.append(f"FK violations: {violations}")
 
-# 3. Check no orphan attachments
-c.execute('''SELECT ia.itemID FROM itemAttachments ia
-             WHERE ia.parentItemID IS NOT NULL
-             AND ia.parentItemID NOT IN (SELECT itemID FROM items)''')
-orphans = c.fetchall()
-assert not orphans, f"Orphan attachments: {orphans}"
+    # 2. Check all synced=0 items have valid keys
+    c.execute('SELECT itemID, key FROM items WHERE synced = 0')
+    for item_id, key in c.fetchall():
+        if len(key) != 8 or not all(ch in VALID_CHARS for ch in key):
+            errors.append(f"Invalid key '{key}' on itemID={item_id}")
 
-# 4. Check no dangling deletedItems
-c.execute('''SELECT di.itemID FROM deletedItems di
-             WHERE di.itemID NOT IN (SELECT itemID FROM items)''')
-dangling = c.fetchall()
-# Clean up any dangling entries
-for (item_id,) in dangling:
-    c.execute('DELETE FROM deletedItems WHERE itemID = ?', (item_id,))
+    # 3. Check no orphan attachments
+    c.execute('''SELECT ia.itemID FROM itemAttachments ia
+                 WHERE ia.parentItemID IS NOT NULL
+                 AND ia.parentItemID NOT IN (SELECT itemID FROM items)''')
+    orphans = c.fetchall()
+    if orphans:
+        errors.append(f"Orphan attachments: {[o[0] for o in orphans]}")
+
+    # 4. Clean dangling deletedItems (auto-fix, not an error)
+    c.execute('''SELECT di.itemID FROM deletedItems di
+                 WHERE di.itemID NOT IN (SELECT itemID FROM items)''')
+    for (item_id,) in c.fetchall():
+        c.execute('DELETE FROM deletedItems WHERE itemID = ?', (item_id,))
+
+    # 5. Check wrong field IDs on unsynced items (legacy data from old skill)
+    c.execute('''SELECT id.itemID, id.fieldID, idv.value
+                 FROM itemData id
+                 JOIN itemDataValues idv ON id.valueID = idv.valueID
+                 WHERE id.itemID IN (SELECT itemID FROM items WHERE synced=0)''')
+    for item_id, field_id, value in c.fetchall():
+        if field_id == 13 and 'arxiv' in value.lower():
+            errors.append(f"itemID={item_id}: fieldID=13 used for URL (should be 10)")
+        elif field_id == 59 and '10.48550' in value:
+            errors.append(f"itemID={item_id}: fieldID=59 used for DOI (should be 8)")
+
+    if errors:
+        conn.rollback()
+        raise ValueError("DB validation failed:\n" + "\n".join(errors))
+
+    conn.commit()
+    print(f"validate_and_commit: OK")
+```
+
+Use it as the ONLY way to commit:
+```python
+# After all writes...
+validate_and_commit(conn)
+conn.close()
 ```
 
 ### Step 9 — Clean Up and Report
@@ -326,6 +358,85 @@ for (item_id,) in dangling:
 Remove temp files (`fix_zotero.py`, `papers_to_add.json`, DB copies).
 Report: X papers added, total library now Y papers.
 Remind user to sync: "Open Zotero and press Ctrl+Shift+S to sync to cloud."
+
+---
+
+## Mode 3: Repair
+
+Scan and fix DB integrity issues. Requires Zotero to be closed. Always backs up DB before modifying.
+
+Usage: `/sync-zotero repair`
+
+### Step 1 — Pre-flight checks
+
+1. Check Zotero is not running (`curl -s http://127.0.0.1:23119/connector/ping` must fail)
+2. If running, ask user to close Zotero first
+3. Backup DB: `shutil.copy2(ZOTERO_DB, ZOTERO_DB + ".bak.repair")`
+
+### Step 2 — Fix invalid item keys
+
+Scan all items for keys containing characters outside Zotero's valid charset (`23456789ABCDEFGHIJKLMNPQRSTUVWXYZ`). Characters `0`, `1`, and `O` are NOT valid.
+
+For each invalid key:
+1. Generate a new valid key using `gen_key(cursor)`
+2. Rename the storage directory: `os.rename(STORAGE/old_key, STORAGE/new_key)`
+3. Update the items table: `UPDATE items SET key=? WHERE itemID=?`
+
+### Step 3 — Fix wrong field IDs (legacy data)
+
+Scan `itemData` for items using wrong field IDs from older skill versions:
+
+| Wrong fieldID | Wrong fieldName | Correct fieldID | Correct fieldName | Detection pattern |
+|---|---|---|---|---|
+| 13 | archiveLocation | 10 | url | value contains `arxiv` |
+| 59 | reporterVolume | 8 | DOI | value contains `10.48550` |
+| 16 | libraryCatalog | 19 | extra | value starts with `arXiv:` followed by digits |
+
+For each wrong mapping:
+1. Check if the correct fieldID already exists for that item
+2. If not: `UPDATE itemData SET fieldID=? WHERE itemID=? AND fieldID=?`
+3. If yes: `DELETE FROM itemData WHERE itemID=? AND fieldID=?` (remove duplicate)
+
+**Note**: Only fix field 16 if value matches `arXiv:\d{4}\.\d+` pattern. The value `arXiv.org` in field 16 is CORRECT (it's libraryCatalog).
+
+### Step 4 — Fix orphan attachments
+
+```python
+c.execute('''SELECT ia.itemID FROM itemAttachments ia
+             WHERE ia.parentItemID IS NOT NULL
+             AND ia.parentItemID NOT IN (SELECT itemID FROM items)''')
+```
+
+For each orphan: use `delete_item(c, orphan_id)` to cleanly remove.
+
+### Step 5 — Fix dangling deletedItems
+
+```python
+c.execute('''SELECT di.itemID FROM deletedItems di
+             WHERE di.itemID NOT IN (SELECT itemID FROM items)''')
+for (item_id,) in c.fetchall():
+    c.execute('DELETE FROM deletedItems WHERE itemID = ?', (item_id,))
+```
+
+### Step 6 — FK validation
+
+```python
+c.execute('PRAGMA foreign_key_check')
+violations = c.fetchall()
+```
+
+Report any remaining violations for manual investigation.
+
+### Step 7 — Commit and report
+
+Use `validate_and_commit(conn)` to commit all fixes. Report:
+- X invalid keys fixed
+- X wrong field IDs corrected
+- X orphan attachments removed
+- X dangling deletedItems cleaned
+- FK violations: pass/fail
+
+Remind user: "Open Zotero and press Ctrl+Shift+S to sync."
 
 ---
 
