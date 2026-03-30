@@ -42,10 +42,12 @@ Required paths:
 
 ### Platform Notes
 
-- **Windows (Python 3.14)**: SSL broken in urllib; always use `curl.exe` for HTTPS downloads
+- **Windows (Python 3.14)**: SSL broken in urllib; always use `curl.exe` with `--ssl-no-revoke` for HTTPS downloads
 - **All platforms**: Always `sys.stdout.reconfigure(encoding='utf-8')` in Python scripts
+- **Real-time output**: Use `print = functools.partial(print, flush=True)` for background/long-running scripts
 - **Zotero locking**: Copy DB for reads when Zotero is running; close Zotero for writes
-- Check if Zotero is running: `curl -s http://127.0.0.1:23119/connector/ping`
+- **Close Zotero**: On Windows use `Stop-Process -Name zotero -Force`; then wait 3 seconds before writing
+- Check if Zotero is running: `curl -s http://127.0.0.1:23119/connector/ping` or check process list
 
 ---
 
@@ -70,9 +72,10 @@ For each attachment, check if file exists at `{STORAGE}/{key}/{filename}`. Class
 
 ### Step 2 — Extract arXiv IDs
 
-From parent item's metadata fields:
-- `fieldID=16` (extra): Look for `arXiv:XXXX.XXXXX`
-- `fieldID=13` (url): Look for `arxiv.org/abs/XXXX.XXXXX`
+From parent item's metadata fields (use the CORRECT field IDs):
+- `fieldID=19` (extra): Look for `arXiv:XXXX.XXXXX`
+- `fieldID=10` (url): Look for `arxiv.org/abs/XXXX.XXXXX`
+- `fieldID=107` (archiveID): Look for `arXiv:XXXX.XXXXX`
 
 Regex: `(\d{4}\.\d{4,5})`
 
@@ -88,7 +91,8 @@ latest_v = max(int(v) for v in versions) if versions else 1
 
 Use `curl.exe` (or `curl` on Linux/macOS):
 ```bash
-curl -L -o "{ACADEMY_DIR}/{arxivID}v{N} {Title}.pdf" "https://arxiv.org/pdf/{arxivID}v{N}"
+# Windows: use --ssl-no-revoke to avoid CRYPT_E_REVOCATION_OFFLINE
+curl.exe --ssl-no-revoke -L -o "{ACADEMY_DIR}/{arxivID}v{N} {Title}.pdf" "https://arxiv.org/pdf/{arxivID}v{N}"
 ```
 
 Filename convention: `{arxivID}v{version} {Title}.pdf`
@@ -104,8 +108,8 @@ For **existing attachments** (syncState=1, record exists but no file):
 2. `UPDATE itemAttachments SET syncState = 0 WHERE itemID = ?`
 
 For **items with no attachment record** (parent exists, no PDF child):
-1. Generate unique 8-char key (uppercase + digits, no collision)
-2. Create attachment item (itemTypeID=3)
+1. Generate unique 8-char key (**CRITICAL: use Zotero charset**, see Key Generation below)
+2. Create attachment item (itemTypeID=3, version=0, synced=0)
 3. Create itemAttachments record (linkMode=0, contentType='application/pdf', path='storage:{filename}', syncState=0)
 4. Set title field (fieldID=1) on attachment
 5. Copy PDF to `{STORAGE}/{new_key}/{filename}`
@@ -133,9 +137,9 @@ SELECT i.itemID, idv_t.value AS title, idv_e.value AS extra, idv_u.value AS url
 FROM items i
 LEFT JOIN itemData id_t ON i.itemID = id_t.itemID AND id_t.fieldID = 1
 LEFT JOIN itemDataValues idv_t ON id_t.valueID = idv_t.valueID
-LEFT JOIN itemData id_e ON i.itemID = id_e.itemID AND id_e.fieldID = 16
+LEFT JOIN itemData id_e ON i.itemID = id_e.itemID AND id_e.fieldID = 19
 LEFT JOIN itemDataValues idv_e ON id_e.valueID = idv_e.valueID
-LEFT JOIN itemData id_u ON i.itemID = id_u.itemID AND id_u.fieldID = 13
+LEFT JOIN itemData id_u ON i.itemID = id_u.itemID AND id_u.fieldID = 10
 LEFT JOIN itemDataValues idv_u ON id_u.valueID = idv_u.valueID
 WHERE i.itemTypeID NOT IN (3, 14) AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
 ```
@@ -166,18 +170,18 @@ Filter: only IDs starting with `{year_prefix}` (e.g., "26" for 2026), not in exi
 Launch parallel Task agents to search:
 
 **Recommended sources** (use WebFetch):
-- `sebastianraschka.com` — ML research blog
-- `www.interconnects.ai` — Nathan Lambert's AI blog
-- `simonwillison.net` — LLM practitioner blog
-- `karpathy.github.io` — Karpathy's blog
-- `thezvi.substack.com` — AI analysis
-- `www.latent.space` — AI engineering
-- `the-decoder.com` — AI news
-- `www.marktechpost.com` — AI research news
-- `newsletter.maartengrootendorst.com` — NLP newsletter
-- `news.ycombinator.com` — HN (search AI/ML papers)
-- `www.reddit.com/r/MachineLearning` — Top posts
-- `paperswithcode.com/greatest` — Trending papers
+- `sebastianraschka.com` -- ML research blog
+- `www.interconnects.ai` -- Nathan Lambert's AI blog
+- `simonwillison.net` -- LLM practitioner blog
+- `karpathy.github.io` -- Karpathy's blog
+- `thezvi.substack.com` -- AI analysis
+- `www.latent.space` -- AI engineering
+- `the-decoder.com` -- AI news
+- `www.marktechpost.com` -- AI research news
+- `newsletter.maartengrootendorst.com` -- NLP newsletter
+- `news.ycombinator.com` -- HN (search AI/ML papers)
+- `www.reddit.com/r/MachineLearning` -- Top posts
+- `paperswithcode.com/greatest` -- Trending papers
 
 Each agent should:
 1. Fetch the source
@@ -232,32 +236,42 @@ For all selected papers:
 2. Download PDFs via curl to `ACADEMY_DIR`
 3. Check if Zotero is running (ping connector)
 4. If closed: write directly to DB
-5. If running: write `fix_zotero.py` script and ask user to close Zotero
+5. If running: ask user to close Zotero first
 
 **Creating Zotero items** (when writing directly to DB):
 
 ```python
-# 1. Create parent preprint item
+import datetime
+
+now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+# 1. Create parent preprint item (version=0, synced=0 for new local items)
 c.execute('''INSERT INTO items (itemTypeID, dateAdded, dateModified, clientDateModified,
-             libraryID, key, version, synced) VALUES (31, ?, ?, ?, 1, ?, ?, 0)''',
-             (now, now, now, parent_key, max_ver))
+             libraryID, key, version, synced) VALUES (31, ?, ?, ?, 1, ?, 0, 0)''',
+             (now, now, now, gen_key(c)))
 parent_id = c.lastrowid
 
-# 2. Add metadata fields
+# 2. Add metadata fields -- USE CORRECT FIELD IDs!
 fields = {
-    1: title,           # title
-    6: date,            # date (from arXiv citation_date)
-    13: url,            # url (https://arxiv.org/abs/{id})
-    16: f'arXiv:{id}',  # extra
-    59: f'10.48550/arXiv.{id}'  # DOI
+    1:   title,                             # title
+    6:   date,                              # date (e.g. "2026-03-15")
+    8:   f'10.48550/arXiv.{arxiv_id}',      # DOI
+    10:  f'http://arxiv.org/abs/{arxiv_id}', # url
+    16:  'arXiv.org',                        # libraryCatalog
+    19:  f'arXiv:{arxiv_id} [cs]',           # extra
+    69:  'arXiv',                            # repository
+    107: f'arXiv:{arxiv_id}',                # archiveID
 }
 for field_id, value in fields.items():
     vid = get_or_create_value(c, value)
     c.execute('INSERT OR IGNORE INTO itemData (itemID, fieldID, valueID) VALUES (?, ?, ?)',
               (parent_id, field_id, vid))
 
-# 3. Create attachment item
-c.execute('''INSERT INTO items (itemTypeID, ...) VALUES (3, ...)''')
+# 3. Create attachment item (version=0, synced=0)
+att_key = gen_key(c)
+c.execute('''INSERT INTO items (itemTypeID, dateAdded, dateModified, clientDateModified,
+             libraryID, key, version, synced) VALUES (3, ?, ?, ?, 1, ?, 0, 0)''',
+             (now, now, now, att_key))
 att_id = c.lastrowid
 
 # 4. Create attachment record
@@ -265,14 +279,53 @@ c.execute('''INSERT INTO itemAttachments (itemID, parentItemID, linkMode, conten
              VALUES (?, ?, 0, 'application/pdf', ?, 0)''',
              (att_id, parent_id, f'storage:{pdf_filename}'))
 
-# 5. Copy PDF to storage
-shutil.copy2(src, os.path.join(STORAGE, att_key, pdf_filename))
+# 5. Set title on attachment
+vid = get_or_create_value(c, pdf_filename)
+c.execute('INSERT INTO itemData (itemID, fieldID, valueID) VALUES (?, 1, ?)', (att_id, vid))
+
+# 6. Copy PDF to storage
+storage_dir = os.path.join(STORAGE, att_key)
+os.makedirs(storage_dir, exist_ok=True)
+shutil.copy2(src_pdf, os.path.join(storage_dir, pdf_filename))
 ```
 
-### Step 8 — Clean Up and Report
+### Step 8 — Post-Write Validation
+
+**CRITICAL**: After writing to DB, always validate:
+
+```python
+# 1. Check no FK violations
+c.execute('PRAGMA foreign_key_check')
+violations = c.fetchall()
+assert not violations, f"FK violations: {violations}"
+
+# 2. Check all synced=0 items have valid keys
+c.execute('SELECT key FROM items WHERE synced = 0')
+VALID_CHARS = set('23456789ABCDEFGHIJKLMNPQRSTUVWXYZ')
+for (key,) in c.fetchall():
+    assert len(key) == 8 and all(ch in VALID_CHARS for ch in key), f"Bad key: {key}"
+
+# 3. Check no orphan attachments
+c.execute('''SELECT ia.itemID FROM itemAttachments ia
+             WHERE ia.parentItemID IS NOT NULL
+             AND ia.parentItemID NOT IN (SELECT itemID FROM items)''')
+orphans = c.fetchall()
+assert not orphans, f"Orphan attachments: {orphans}"
+
+# 4. Check no dangling deletedItems
+c.execute('''SELECT di.itemID FROM deletedItems di
+             WHERE di.itemID NOT IN (SELECT itemID FROM items)''')
+dangling = c.fetchall()
+# Clean up any dangling entries
+for (item_id,) in dangling:
+    c.execute('DELETE FROM deletedItems WHERE itemID = ?', (item_id,))
+```
+
+### Step 9 — Clean Up and Report
 
 Remove temp files (`fix_zotero.py`, `papers_to_add.json`, DB copies).
 Report: X papers added, total library now Y papers.
+Remind user to sync: "Open Zotero and press Ctrl+Shift+S to sync to cloud."
 
 ---
 
@@ -282,30 +335,53 @@ Report: X papers added, total library now Y papers.
 | itemTypeID | Type |
 |---|---|
 | 3 | attachment |
-| 14 | attachment (alt) |
+| 14 | note |
 | 22 | journalArticle |
 | 31 | preprint |
 | 40 | webpage |
 
-### Field IDs
-| fieldID | Name | Usage |
+### Field IDs for Preprints (itemTypeID=31)
+
+**CRITICAL**: Use the correct field IDs. These are verified against the Zotero schema:
+
+| fieldID | fieldName | Usage | Example |
+|---|---|---|---|
+| 1 | title | Paper title | "Attention Is All You Need" |
+| 2 | abstractNote | Abstract | (full abstract text) |
+| 6 | date | Publication date | "2026-03-15" |
+| 8 | **DOI** | Digital Object ID | "10.48550/arXiv.2603.12345" |
+| 10 | **url** | Paper URL | "http://arxiv.org/abs/2603.12345" |
+| 11 | accessDate | When item was added | "2026-03-30 12:00:00" |
+| 14 | shortTitle | Short title | "Attention" |
+| 15 | language | Paper language | "en" |
+| 16 | libraryCatalog | Source catalog | "arXiv.org" |
+| 19 | **extra** | Extra metadata | "arXiv:2603.12345 [cs]" |
+| 69 | **repository** | Repository name | "arXiv" |
+| 107 | **archiveID** | Archive identifier | "arXiv:2603.12345" |
+
+**WRONG field IDs to AVOID** (these are valid fields but NOT the standard ones):
+| fieldID | fieldName | DO NOT use for |
 |---|---|---|
-| 1 | title | Paper title |
-| 6 | date | Publication date |
-| 13 | url | arXiv URL |
-| 16 | extra | `arXiv:{id}` |
-| 59 | DOI | `10.48550/arXiv.{id}` |
+| 13 | archiveLocation | ~~URL~~ (use fieldID=10 url instead) |
+| 59 | reporterVolume | ~~DOI~~ (use fieldID=8 DOI instead) |
 
 ### Key Generation
+
+**CRITICAL**: Zotero keys use a RESTRICTED character set that excludes `0` (zero), `1` (one), and `O` (letter O) to avoid visual ambiguity. Using the wrong charset causes `"'{key}' is not a valid item key"` errors during sync.
+
 ```python
-import string, random
-def gen_key(existing_keys):
-    chars = string.ascii_uppercase + string.digits
+import random
+
+# Zotero's ACTUAL key charset -- NO '0', '1', or 'O'
+ZOTERO_KEY_CHARS = '23456789ABCDEFGHIJKLMNPQRSTUVWXYZ'
+
+def gen_key(cursor):
+    """Generate a valid 8-char Zotero item key."""
     while True:
-        k = ''.join(random.choices(chars, k=8))
-        if k not in existing_keys:
-            existing_keys.add(k)
-            return k
+        key = ''.join(random.choices(ZOTERO_KEY_CHARS, k=8))
+        cursor.execute('SELECT COUNT(*) FROM items WHERE key = ?', (key,))
+        if cursor.fetchone()[0] == 0:
+            return key
 ```
 
 ### Value Lookup/Create
@@ -318,13 +394,72 @@ def get_or_create_value(c, value):
     return c.lastrowid
 ```
 
+### Sync Model
+
+Items in Zotero have two key sync fields:
+- `synced`: 0 = has local changes pending upload, 1 = in sync with server
+- `version`: 0 = never synced to server, >0 = last known server version
+
+For **new local items**: set `version=0, synced=0`. Zotero will upload them on next sync.
+For **items synced from server**: they have `version>0, synced=1`. Do not modify these unless intentional.
+
+### Attachment Model
+
+```
+itemAttachments columns:
+  itemID, parentItemID, linkMode, contentType, charsetID, path, syncState,
+  storageModTime, storageHash, lastProcessedModificationTime
+```
+
+- `linkMode=0`: imported file (stored in Zotero storage)
+- `syncState=0`: file is present locally
+- `syncState=1`: file needs to be downloaded
+- `path`: format is `storage:{filename}` for imported files
+- `storageModTime`, `storageHash`: can be NULL; Zotero fills these during sync
+
+### Deleting Items
+
+When deleting items from the DB directly, clean up ALL related tables:
+
+```python
+def delete_item(c, item_id):
+    """Delete an item and all its related records."""
+    # Delete child attachments first
+    c.execute('SELECT itemID FROM itemAttachments WHERE parentItemID = ?', (item_id,))
+    for (child_id,) in c.fetchall():
+        delete_item(c, child_id)  # recursive for attachments
+
+    # Remove from all related tables
+    for table in ['itemData', 'itemTags', 'itemCreators', 'itemRelations',
+                  'collectionItems', 'itemAttachments', 'deletedItems',
+                  'itemAnnotations', 'itemNotes']:
+        try:
+            c.execute(f'DELETE FROM {table} WHERE itemID = ?', (item_id,))
+        except:
+            pass  # table may not exist in all Zotero versions
+
+    # Remove storage directory
+    c.execute('SELECT key FROM items WHERE itemID = ?', (item_id,))
+    row = c.fetchone()
+    if row:
+        storage_dir = os.path.join(STORAGE, row[0])
+        if os.path.isdir(storage_dir):
+            shutil.rmtree(storage_dir)
+
+    # Remove from items table
+    c.execute('DELETE FROM items WHERE itemID = ?', (item_id,))
+```
+
 ---
 
 ## Error Handling
 
-- **DB locked**: Copy DB for reads; ask user to close Zotero for writes
-- **SSL errors (Python urllib)**: Use `curl.exe` / `curl` for all HTTPS
+- **DB locked**: Copy DB for reads; ask user to close Zotero for writes. Use retry loop (30 attempts, 2s apart) with `BEGIN EXCLUSIVE` test
+- **SSL errors (Python urllib)**: Use `curl.exe` / `curl` for all HTTPS; on Windows add `--ssl-no-revoke`
 - **arXiv rate limiting**: Add `time.sleep(1)` between requests; batch 5 then pause
 - **Encoding errors (Windows)**: Always `sys.stdout.reconfigure(encoding='utf-8')`
-- **Duplicate items**: Check existing arXiv IDs before creating; delete accidental duplicates from `items`, `itemData`, `itemAttachments`, `itemCreators`, `itemTags`, `itemRelations`, `collectionItems`
+- **Output buffering**: Use `print = functools.partial(print, flush=True)` for real-time output
+- **Duplicate items**: Check existing arXiv IDs before creating; delete accidental duplicates using `delete_item()` above
 - **Hallucinated papers from search agents**: Always verify arXiv ID exists before presenting to user
+- **Invalid keys after creation**: Always run post-write validation (Step 8). If keys contain `0`, `1`, or `O`, regenerate them
+- **FK violations**: Run `PRAGMA foreign_key_check` after writes. Fix orphan attachments and dangling deletedItems entries
