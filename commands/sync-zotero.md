@@ -73,12 +73,27 @@ For each attachment, check if file exists at `{STORAGE}/{key}/{filename}`. Class
 
 ### Step 2 — Extract arXiv IDs
 
-From parent item's metadata fields (use the CORRECT field IDs):
-- `fieldID=19` (extra): Look for `arXiv:XXXX.XXXXX`
-- `fieldID=10` (url): Look for `arxiv.org/abs/XXXX.XXXXX`
-- `fieldID=107` (archiveID): Look for `arXiv:XXXX.XXXXX`
+**IMPORTANT**: Search ALL metadata fields for arXiv IDs, not just specific ones. Different Zotero clients and plugins store arXiv info in different fields. Query all fields for each parent item:
 
-Regex: `(\d{4}\.\d{4,5})`
+```sql
+SELECT id.fieldID, idv.value
+FROM itemData id
+JOIN itemDataValues idv ON id.valueID = idv.valueID
+WHERE id.itemID = ?
+```
+
+Then scan ALL values with regex: `(\d{4}\.\d{4,5})`
+
+Validate extracted IDs: the year prefix (first 2 digits) must be reasonable (15-27). Skip IDs like `2023.10004` or `1070.2023` which are DOI fragments, not arXiv IDs.
+
+Known fields where arXiv IDs appear:
+- `fieldID=19` (extra): `arXiv:XXXX.XXXXX`
+- `fieldID=10` (url): `arxiv.org/abs/XXXX.XXXXX`
+- `fieldID=107` (archiveID): `arXiv:XXXX.XXXXX`
+- `fieldID=13` (archiveLocation): `http://arxiv.org/abs/XXXX.XXXXX` (used by some Zotero plugins)
+- `fieldID=8` (DOI): `10.48550/arXiv.XXXX.XXXXX`
+
+Prefer IDs from fields that contain `arxiv` in the value (more reliable than bare DOI matches).
 
 ### Step 3 — Check Latest Version on arXiv
 
