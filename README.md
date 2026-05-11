@@ -6,8 +6,10 @@ Personal collection of [Claude Code](https://claude.com/claude-code) slash comma
 
 | Command | Description |
 |---------|-------------|
-| `/sync-zotero` | Sync Zotero library: download missing PDFs from arXiv, discover new papers by topic, import with user confirmation |
+| `/sync-zotero` | Sync Zotero library: download missing PDFs from arXiv, discover new papers by topic, repair DB integrity, merge duplicate items, import with user confirmation |
 | `/commit` | Create well-formatted commits with conventional commit messages |
+| `/disk-cleanup` | Scan macOS disk for caches, duplicate files, and unused apps with interactive confirmation |
+| `/cloud-dedup` | Scan cloud drives (Aliyun Pan, Baidu Netdisk) for duplicate and junk files |
 
 ## Installation
 
@@ -46,6 +48,8 @@ In Claude Code, use the slash command:
 /sync-zotero              # Sync missing PDFs
 /sync-zotero discover     # Search for new papers and ask one-by-one
 /sync-zotero full         # Sync + discover
+/sync-zotero repair       # Fix DB integrity issues (invalid keys, wrong field IDs, orphans)
+/sync-zotero merge        # Detect and merge duplicate items (arXiv / DOI / title)
 
 /commit                   # Create conventional commit
 /commit --style=full      # Detailed commit message

@@ -1,11 +1,11 @@
 ---
-argument-hint: [sync|discover|full|repair] [--topics=reasoning,agentic,world-model,...] [--year=2026]
-description: Sync missing Zotero PDFs from arXiv, discover new papers by topic, repair DB integrity, and import with user confirmation
+argument-hint: [sync|discover|full|repair|merge] [--topics=reasoning,agentic,world-model,...] [--year=2026]
+description: Sync missing Zotero PDFs from arXiv, discover new papers by topic, repair DB integrity, merge duplicate items, and import with user confirmation
 ---
 
 # Zotero Paper Sync & Discovery
 
-Manage a Zotero library: sync missing PDFs, discover new papers from arXiv/blogs/KOL, and import selected papers with user confirmation.
+Manage a Zotero library: sync missing PDFs, discover new papers from arXiv/blogs/KOL, import selected papers with user confirmation, and merge duplicate entries safely.
 
 ## Modes
 
@@ -13,8 +13,9 @@ Manage a Zotero library: sync missing PDFs, discover new papers from arXiv/blogs
 - `discover`: Search arXiv + blogs for new papers matching research interests, ask user one-by-one, import selected
 - `full`: Run sync first, then discover
 - `repair`: Scan and fix DB integrity issues (invalid keys, wrong field IDs, orphan records, dangling references)
+- `merge`: Detect and merge duplicate items (same arXiv ID / DOI / title), preserving PDFs, annotations, and user comments
 
-Usage: `/sync-zotero`, `/sync-zotero sync`, `/sync-zotero discover --topics=reasoning,agentic`, `/sync-zotero full`, `/sync-zotero repair`
+Usage: `/sync-zotero`, `/sync-zotero sync`, `/sync-zotero discover --topics=reasoning,agentic`, `/sync-zotero full`, `/sync-zotero repair`, `/sync-zotero merge`
 
 ---
 
@@ -455,6 +456,175 @@ Remind user: "Open Zotero and press Ctrl+Shift+S to sync."
 
 ---
 
+## Mode 4: Merge Duplicates
+
+Detect and merge duplicate items while preserving all user content (PDFs, highlights, comments, notes, tags, collection memberships). Requires Zotero to be closed.
+
+Usage: `/sync-zotero merge`
+
+### Design principles (lessons learned)
+
+1. **Union-find across ALL signatures**, never exclusive priority. A duplicate pair may match on title but not on arXiv ID (e.g. one item has `arXiv:` metadata, the other has only the title). Build disjoint-set clusters by walking every signature type.
+2. **Normalize aggressively for title matching**. Strip all non-alphanumeric + non-CJK characters, lowercase. Short normalized titles (< 8 chars) are unreliable — skip them.
+3. **Validate arXiv IDs**. The regex `\d{4}\.\d{4,5}` matches DOI fragments like `2023.10004`. Require year prefix in `15..27`.
+4. **Ignore synthesized DOIs**. `10.48550/arXiv.*` is derived from the arXiv ID, not a real DOI — do not cluster on it (use the arXiv ID signature instead).
+5. **Primary selection is deterministic**: `(-has_pdf, -n_comments, -n_annotations, dateAdded, itemID)`. Keep the richest record; if tied, keep the oldest (earliest `dateAdded`), then lowest itemID.
+6. **Preview before destructive ops** — especially if the match count is unexpectedly large. Use `AskUserQuestion` to confirm scope.
+7. **Protect items with user comments**. If a duplicate has user-authored comments on annotations and the primary does not, this changes the primary selection (comments dominate PDF presence in terms of irreplaceable user work). See scoring tuple above.
+8. **Post-merge set `synced=0, dateModified=now`** on surviving primaries so Zotero cloud sync picks up the change.
+
+### Step 1 — Pre-flight checks
+
+1. Confirm Zotero is not running (`curl -s http://127.0.0.1:23119/connector/ping` must fail)
+2. If running: instruct user or run `Stop-Process -Name zotero -Force` (Windows), wait 3 s
+3. Backup DB: `shutil.copy2(ZOTERO_DB, ZOTERO_DB + ".bak.merge")` — MANDATORY, never skip
+
+### Step 2 — Collect item metadata
+
+For every non-attachment, non-note item (itemTypeID NOT IN (3, 14)), not in `deletedItems`, gather:
+
+- `itemID`, `key`, `itemTypeID`, `dateAdded`
+- `title` (fieldID=1)
+- `arxiv_id` — scan ALL fields (19, 10, 107, 13, 8, 2) with `\d{4}\.\d{4,5}` then filter by year prefix 15..27
+- `doi` (fieldID=8) — drop if starts with `10.48550/arXiv.`
+- `norm_title` — lowercase, stripped of non-alphanumeric/CJK chars
+- `has_pdf` — existence check on disk, not just DB row (verify file exists and size > 0)
+- `n_annotations`, `n_comments` — count highlights; count annotations where `comment IS NOT NULL AND comment != ''`
+
+### Step 3 — Cluster with union-find
+
+```python
+from collections import defaultdict
+
+parent = {iid: iid for iid in info}
+def find(x):
+    while parent[x] != x:
+        parent[x] = parent[parent[x]]
+        x = parent[x]
+    return x
+def union(a, b):
+    ra, rb = find(a), find(b)
+    if ra != rb: parent[ra] = rb
+
+# Bucket by each signature independently
+groups = defaultdict(list)
+for iid, d in info.items():
+    if d['arxiv']:
+        groups[f'a:{d["arxiv"]}'].append(iid)
+    if d['doi']:
+        groups[f'd:{d["doi"]}'].append(iid)
+    if d['norm'] and len(d['norm']) >= 8:
+        groups[f't:{d["norm"]}'].append(iid)
+
+# Union all items sharing any signature
+for sig, ids in groups.items():
+    if len(ids) > 1:
+        for i in ids[1:]:
+            union(ids[0], i)
+
+# Materialize clusters
+clusters = defaultdict(list)
+for iid in info:
+    clusters[find(iid)].append(iid)
+clusters = [ids for ids in clusters.values() if len(ids) > 1]
+```
+
+### Step 4 — Select primary per cluster
+
+```python
+def score(d):
+    # lower is better
+    return (0 if d['has_pdf'] else 1,
+            -d['n_comments'],
+            -d['n_annotations'],
+            d['dateAdded'] or '9999',
+            d['itemID'])
+
+for cluster in clusters:
+    cluster.sort(key=lambda iid: score(info[iid]))
+    primary = cluster[0]
+    duplicates = cluster[1:]
+```
+
+### Step 5 — Preview and confirm
+
+Write a JSON plan listing each cluster with primary + duplicates and reasons (has_pdf, has_comments, dateAdded). Print a summary and — if the count is large (> 20) or the user has not pre-confirmed — use `AskUserQuestion` with options:
+
+- "Merge all N groups"
+- "Show plan and let me review first"
+- "Cancel"
+
+### Step 6 — Execute merge
+
+For each duplicate group, inside a single transaction:
+
+```python
+def merge_duplicate(c, primary_id, dup_id):
+    # 1. Move annotations from duplicate's PDF to primary's PDF (if primary has one)
+    c.execute('SELECT itemID FROM itemAttachments WHERE parentItemID = ?', (dup_id,))
+    dup_atts = [r[0] for r in c.fetchall()]
+
+    c.execute("""SELECT itemID FROM itemAttachments
+                 WHERE parentItemID=? AND contentType='application/pdf' LIMIT 1""",
+              (primary_id,))
+    primary_pdf = c.fetchone()
+    primary_pdf_id = primary_pdf[0] if primary_pdf else None
+
+    for att_id in dup_atts:
+        c.execute("SELECT COUNT(*) FROM itemAnnotations WHERE parentItemID = ?", (att_id,))
+        n_ann = c.fetchone()[0]
+        if n_ann > 0 and primary_pdf_id:
+            # Move annotations to primary's PDF
+            c.execute('UPDATE itemAnnotations SET parentItemID=? WHERE parentItemID=?',
+                      (primary_pdf_id, att_id))
+        elif not primary_pdf_id:
+            # Primary has no PDF -- reparent the whole attachment
+            c.execute('UPDATE itemAttachments SET parentItemID=? WHERE itemID=?',
+                      (primary_id, att_id))
+            continue  # do not delete, it now belongs to primary
+
+    # 2. Move notes to primary
+    c.execute('UPDATE itemNotes SET parentItemID=? WHERE parentItemID=?',
+              (primary_id, dup_id))
+
+    # 3. Delete the duplicate (and any remaining child attachments)
+    delete_item(c, dup_id)
+
+# Mark primaries as locally modified so Zotero syncs them
+now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+for primary_id in primary_ids:
+    c.execute('UPDATE items SET dateModified=?, synced=0 WHERE itemID=?',
+              (now, primary_id))
+```
+
+**Note on collections**: `UPDATE collectionItems SET itemID=primary WHERE itemID=dup` can fail on the unique constraint `(collectionID, itemID)` if both items are in the same collection. Prefer to simply delete the duplicate's `collectionItems` rows via `delete_item()` — the primary likely already has the same memberships, and if not the user can re-add.
+
+**Note on tags**: same caveat; `delete_item()` cleans `itemTags` for the duplicate. If you want to preserve unique tags from the duplicate, run `INSERT OR IGNORE INTO itemTags (itemID, tagID, type) SELECT ?, tagID, type FROM itemTags WHERE itemID = ?` with `(primary_id, dup_id)` BEFORE calling `delete_item`.
+
+### Step 7 — Validate and commit
+
+Must use `validate_and_commit(conn)` (see Mode 2 Step 8). It runs `PRAGMA foreign_key_check` and rolls back on any violation. **Rollback is the correct behavior** — the backup is on disk and the script can be rerun after the logic bug is fixed.
+
+### Step 8 — Report
+
+- `N` clusters detected, `M` items merged (M = sum of duplicates, not clusters)
+- Library size before/after
+- Annotations reparented, notes reparented, storage folders removed
+- Remind user: "Open Zotero and press Ctrl+Shift+S to sync deletions to cloud."
+
+### Common pitfalls
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| 0 duplicate clusters found when obvious dupes exist in UI | Exclusive signature priority (arxiv beats title) | Union-find across ALL signatures; never `elif` between signature types |
+| `FK violation on fulltextItems` during merge | `delete_item` missed `fulltextItems` / `fulltextItemWords` / `itemTopLevel` / `highlights` / `annotations` tables | Use the expanded `delete_item` (see Zotero DB Reference below) |
+| `UNIQUE constraint failed: collectionItems` | Primary already in the same collection as duplicate | Do not UPDATE; let `delete_item` drop the duplicate's `collectionItems` row |
+| Unpacking error on `norm_title` | Function returns empty string in one branch, tuple in another | Make return type consistent (`return ('', '')` for empty case) |
+| Today's newly-imported paper appears "deleted" | User imported twice at different times; merge correctly removed one copy | Check `zotero.sqlite.bak.merge` vs live DB to prove no unintended delete |
+| Merge silently removes items user still wanted | Scoring did not weight `n_comments` high enough | Ensure `(-has_pdf, -n_comments, ...)` places comments before recency |
+
+---
+
 ## Zotero DB Reference
 
 ### Item Types
@@ -555,13 +725,17 @@ def delete_item(c, item_id):
     for (child_id,) in c.fetchall():
         delete_item(c, child_id)  # recursive for attachments
 
-    # Remove from all related tables
+    # Remove from all related tables. The fulltext* / highlights / annotations /
+    # itemTopLevel tables are REQUIRED to avoid FK violations during merge --
+    # Zotero's indexer populates fulltextItems rows for every PDF attachment.
     for table in ['itemData', 'itemTags', 'itemCreators', 'itemRelations',
                   'collectionItems', 'itemAttachments', 'deletedItems',
-                  'itemAnnotations', 'itemNotes']:
+                  'itemAnnotations', 'itemNotes',
+                  'fulltextItems', 'fulltextItemWords', 'itemTopLevel',
+                  'highlights', 'annotations']:
         try:
             c.execute(f'DELETE FROM {table} WHERE itemID = ?', (item_id,))
-        except:
+        except sqlite3.OperationalError:
             pass  # table may not exist in all Zotero versions
 
     # Remove storage directory
