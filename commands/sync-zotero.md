@@ -719,36 +719,79 @@ When deleting items from the DB directly, clean up ALL related tables:
 
 ```python
 def delete_item(c, item_id):
-    """Delete an item and all its related records."""
-    # Delete child attachments first
+    """Delete an item and all its related records.
+
+    CRITICAL: Must recurse into THREE kinds of child relationships before deleting:
+    - itemAttachments.parentItemID  (child PDFs, snapshots)
+    - itemNotes.parentItemID        (child notes — easy to forget)
+    - itemAnnotations.parentItemID  (highlights on a PDF child)
+
+    Forgetting itemNotes.parentItemID causes FK violations like
+    `('itemNotes', <note_id>, 'items', 0)` when you later try to empty trash or
+    run merge. Observed 2026-05-11 on a 600+ item library — 7 orphan notes
+    rolled back a 49-item trash-empty operation until this recursion was added.
+    """
+    # 1. Recurse into child ATTACHMENTS
     c.execute('SELECT itemID FROM itemAttachments WHERE parentItemID = ?', (item_id,))
     for (child_id,) in c.fetchall():
-        delete_item(c, child_id)  # recursive for attachments
+        delete_item(c, child_id)
 
-    # Remove from all related tables. The fulltext* / highlights / annotations /
-    # itemTopLevel tables are REQUIRED to avoid FK violations during merge --
-    # Zotero's indexer populates fulltextItems rows for every PDF attachment.
-    for table in ['itemData', 'itemTags', 'itemCreators', 'itemRelations',
-                  'collectionItems', 'itemAttachments', 'deletedItems',
-                  'itemAnnotations', 'itemNotes',
-                  'fulltextItems', 'fulltextItemWords', 'itemTopLevel',
-                  'highlights', 'annotations']:
-        try:
-            c.execute(f'DELETE FROM {table} WHERE itemID = ?', (item_id,))
-        except sqlite3.OperationalError:
-            pass  # table may not exist in all Zotero versions
+    # 2. Recurse into child NOTES (via itemNotes.parentItemID, not itemAttachments)
+    c.execute('SELECT itemID FROM itemNotes WHERE parentItemID = ?', (item_id,))
+    for (note_id,) in c.fetchall():
+        delete_item(c, note_id)
 
-    # Remove storage directory
+    # 3. Recurse into child ANNOTATIONS
+    c.execute('SELECT itemID FROM itemAnnotations WHERE parentItemID = ?', (item_id,))
+    for (ann_id,) in c.fetchall():
+        delete_item(c, ann_id)
+
+    # 4. Get key for storage cleanup BEFORE deleting the items row
     c.execute('SELECT key FROM items WHERE itemID = ?', (item_id,))
     row = c.fetchone()
-    if row:
-        storage_dir = os.path.join(STORAGE, row[0])
-        if os.path.isdir(storage_dir):
-            shutil.rmtree(storage_dir)
+    key = row[0] if row else None
 
-    # Remove from items table
+    # 5. Drop every row referencing this itemID. The fulltext* / highlights /
+    #    itemTopLevel tables are REQUIRED on Zotero 7+ to avoid FK violations
+    #    during merge or empty-trash. Missing tables are try/except'd.
+    tables = [
+        'itemData', 'itemTags', 'itemCreators', 'itemRelations',
+        'collectionItems', 'itemAttachments', 'deletedItems',
+        'itemAnnotations', 'itemNotes',
+        # Extended coverage for Zotero 7+:
+        'fulltextItems', 'fulltextItemWords', 'itemTopLevel',
+        'highlights', 'groupItems', 'feedItems',
+        'syncedSettings', 'publicationsItems',
+    ]
+    for t in tables:
+        try:
+            c.execute(f'DELETE FROM {t} WHERE itemID = ?', (item_id,))
+        except sqlite3.OperationalError:
+            pass  # table absent in this schema version
+
+    # 6. Remove storage directory (linked-file entries outside STORAGE stay intact)
+    if key:
+        storage_dir = os.path.join(STORAGE, key)
+        if os.path.isdir(storage_dir):
+            try:
+                shutil.rmtree(storage_dir)
+            except Exception:
+                pass
+
+    # 7. Finally drop the items row itself
     c.execute('DELETE FROM items WHERE itemID = ?', (item_id,))
 ```
+
+**Common FK-rollback scenarios** (all fixed by the expanded recursion + table list above):
+
+| FK violation signature | Root cause |
+|---|---|
+| `('itemNotes', <note_id>, 'items', 0)` during empty-trash or merge | `delete_item` didn't recurse via `itemNotes.parentItemID` — child notes of the deleted parent became orphans |
+| `('fulltextItems', <att_id>, 'items', 0)` | PDF was indexed; deleting the attachment row left an orphan fulltext entry |
+| `('itemTopLevel', <iid>, 'items', 0)` | `itemTopLevel` view/materialized table references removed item |
+| `('highlights', <ann_id>, 'items', 0)` on Zotero 7+ | newer schema has a separate highlights table |
+
+The `empty-trash` workflow (and `merge` Step 6) should run `PRAGMA foreign_key_check` **before** `commit()`, and rollback on any violation — the DB backup at Step 1 makes the rerun cheap.
 
 ---
 
